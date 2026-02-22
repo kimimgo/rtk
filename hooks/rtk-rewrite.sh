@@ -240,6 +240,20 @@ elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+vet([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^go vet/rtk go vet/')"
 elif echo "$MATCH_CMD" | grep -qE '^golangci-lint([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^golangci-lint/rtk golangci-lint/')"
+
+# --- Ruby tooling (proxy: no native RTK support) ---
+elif echo "$MATCH_CMD" | grep -qE '^bundle[[:space:]]+exec[[:space:]]+(rspec|rails|rake|rubocop)([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^bundle exec /rtk proxy bundle exec /')"
+elif echo "$MATCH_CMD" | grep -qE '^(rspec|rubocop)([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(rspec|rubocop)/rtk proxy \1/')"
+elif echo "$MATCH_CMD" | grep -qE '^rails[[:space:]]+(test|routes|console)([[:space:]]|$)'; then
+  # skip: rails console is interactive
+  if echo "$MATCH_CMD" | grep -qE '^rails[[:space:]]+console([[:space:]]|$)'; then
+    exit 0
+  fi
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^rails /rtk proxy rails /')"
+elif echo "$MATCH_CMD" | grep -qE '^rake([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^rake/rtk proxy rake/')"
 fi
 
 # If no rewrite needed, approve as-is
