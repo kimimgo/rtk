@@ -21,6 +21,18 @@ fi
 # We only rewrite if the FIRST command in a chain matches.
 FIRST_CMD="$CMD"
 
+# Strip accidental rtk proxy on commands that should bypass rtk (docker exec, psql, etc.)
+case "$FIRST_CMD" in
+  rtk\ proxy\ docker\ exec\ *)
+    STRIPPED=$(echo "$CMD" | sed 's/^rtk proxy //')
+    ORIGINAL_INPUT=$(echo "$INPUT" | jq -c '.tool_input')
+    UPDATED_INPUT=$(echo "$ORIGINAL_INPUT" | jq --arg cmd "$STRIPPED" '.command = $cmd')
+    jq -n --argjson updated "$UPDATED_INPUT" \
+      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"RTK strip: docker exec bypasses rtk","updatedInput":$updated}}'
+    exit 0
+    ;;
+esac
+
 # Skip if already using rtk
 case "$FIRST_CMD" in
   rtk\ *|*/rtk\ *) exit 0 ;;
@@ -47,20 +59,32 @@ REWRITTEN=""
 
 # --- Git commands ---
 if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]'; then
+  # Skip: git -C <path> — RTK doesn't support git's global -C flag
+  if echo "$MATCH_CMD" | grep -qE '^git[[:space:]]+-C[[:space:]]'; then
+    exit 0
+  fi
   GIT_SUBCMD=$(echo "$MATCH_CMD" | sed -E \
     -e 's/^git[[:space:]]+//' \
-    -e 's/(-C|-c)[[:space:]]+[^[:space:]]+[[:space:]]*//g' \
+    -e 's/(-c)[[:space:]]+[^[:space:]]+[[:space:]]*//g' \
     -e 's/--[a-z-]+=[^[:space:]]+[[:space:]]*//g' \
     -e 's/--(no-pager|no-optional-locks|bare|literal-pathspecs)[[:space:]]*//g' \
     -e 's/^[[:space:]]+//')
   case "$GIT_SUBCMD" in
-    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *)
+    status|status\ *|diff|diff\ *|log|log\ *|add|add\ *|commit|commit\ *|push|push\ *|pull|pull\ *|branch|branch\ *|fetch|fetch\ *|stash|stash\ *|show|show\ *|remote|remote\ *|checkout|checkout\ *|worktree|worktree\ *|merge|merge\ *|reset|reset\ *|tag|tag\ *|rebase|rebase\ *|cherry-pick|cherry-pick\ *)
       REWRITTEN="${ENV_PREFIX}rtk $CMD_BODY"
       ;;
   esac
 
-# --- GitHub CLI (added: api, release) ---
-elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release)([[:space:]]|$)'; then
+# --- GitHub CLI (added: api, release, repo) ---
+elif echo "$MATCH_CMD" | grep -qE '^gh[[:space:]]+(pr|issue|run|api|release|repo)([[:space:]]|$)'; then
+  # Skip when piped to JSON parsers (rtk rewrites JSON → parse failure)
+  if echo "$CMD" | grep -qE '\|[[:space:]]*(python3|python|jq|node|ruby)([[:space:]]|$)'; then
+    exit 0
+  fi
+  # Skip when using --jq (structured JSON output expected, RTK would mangle it)
+  if echo "$CMD" | grep -qE -- '--jq[[:space:]]'; then
+    exit 0
+  fi
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^gh /rtk gh /')"
 
 # --- Cargo ---
@@ -126,10 +150,22 @@ elif echo "$MATCH_CMD" | grep -qE '^pnpm[[:space:]]+playwright([[:space:]]|$)'; 
 elif echo "$MATCH_CMD" | grep -qE '^(npx[[:space:]]+)?prisma([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(npx )?prisma/rtk prisma/')"
 
-# --- Containers (added: docker compose, docker run/build/exec, kubectl describe/apply) ---
+# --- Containers (docker compose, docker run/build, kubectl) ---
+# Skip: docker exec — RTK intercepts the command instead of passing to container
+elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+exec([[:space:]]|$)'; then
+  exit 0
 elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]'; then
   if echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+compose([[:space:]]|$)'; then
     REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')"
+  elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]+inspect([[:space:]]|$)'; then
+    # docker inspect: RTK doesn't support it
+    exit 0
+  elif echo "$MATCH_CMD" | grep -qE 'docker[[:space:]]+logs[[:space:]]' && echo "$MATCH_CMD" | grep -qE '(--tail|--since|--follow|--until|-f |-n )'; then
+    # docker logs with unsupported flags
+    exit 0
+  elif echo "$MATCH_CMD" | grep -qE 'docker[[:space:]]+ps[[:space:]]' && echo "$MATCH_CMD" | grep -qE '(--format|--filter|-f )'; then
+    # docker ps with unsupported flags
+    exit 0
   else
     DOCKER_SUBCMD=$(echo "$MATCH_CMD" | sed -E \
       -e 's/^docker[[:space:]]+//' \
@@ -137,7 +173,7 @@ elif echo "$MATCH_CMD" | grep -qE '^docker[[:space:]]'; then
       -e 's/--[a-z-]+=[^[:space:]]+[[:space:]]*//g' \
       -e 's/^[[:space:]]+//')
     case "$DOCKER_SUBCMD" in
-      ps|ps\ *|images|images\ *|logs|logs\ *|run|run\ *|build|build\ *|exec|exec\ *)
+      ps|ps\ *|images|images\ *|logs|logs\ *|run|run\ *|build|build\ *)
         REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^docker /rtk docker /')"
         ;;
     esac
@@ -155,7 +191,11 @@ elif echo "$MATCH_CMD" | grep -qE '^kubectl[[:space:]]'; then
   esac
 
 # --- Network ---
+# Skip curl when piped to JSON parsers (rtk rewrites JSON values → parse failure)
 elif echo "$MATCH_CMD" | grep -qE '^curl[[:space:]]+'; then
+  if echo "$CMD" | grep -qE '\|[[:space:]]*(python3|python|jq|node|ruby)([[:space:]]|$)'; then
+    exit 0
+  fi
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^curl /rtk curl /')"
 elif echo "$MATCH_CMD" | grep -qE '^wget[[:space:]]+'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^wget /rtk wget /')"
@@ -169,12 +209,27 @@ elif echo "$MATCH_CMD" | grep -qE '^pytest([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pytest/rtk pytest/')"
 elif echo "$MATCH_CMD" | grep -qE '^python[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^python -m pytest/rtk pytest/')"
+# uv run <tool> → strip uv run, apply rtk to inner command
+elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+run[[:space:]]+pytest([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^uv run pytest/rtk pytest/')"
+elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+run[[:space:]]+ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^uv run ruff /rtk ruff /')"
+elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+run[[:space:]]+mypy([[:space:]]|$)'; then
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^uv run mypy/rtk err mypy/')"
 elif echo "$MATCH_CMD" | grep -qE '^ruff[[:space:]]+(check|format)([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^ruff /rtk ruff /')"
 elif echo "$MATCH_CMD" | grep -qE '^pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^pip /rtk pip /')"
 elif echo "$MATCH_CMD" | grep -qE '^uv[[:space:]]+pip[[:space:]]+(list|outdated|install|show)([[:space:]]|$)'; then
   REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed 's/^uv pip /rtk pip /')"
+
+# --- tmux (proxy for tracking, skip interactive) ---
+elif echo "$MATCH_CMD" | grep -qE '^(command[[:space:]]+)?tmux[[:space:]]'; then
+  # Skip interactive commands (attach, select-*, choose-*)
+  if echo "$MATCH_CMD" | grep -qE '(attach|select-|choose-)'; then
+    exit 0
+  fi
+  REWRITTEN="${ENV_PREFIX}$(echo "$CMD_BODY" | sed -E 's/^(command )?tmux /rtk proxy tmux /')"
 
 # --- Go tooling ---
 elif echo "$MATCH_CMD" | grep -qE '^go[[:space:]]+test([[:space:]]|$)'; then
